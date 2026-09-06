@@ -343,12 +343,31 @@ const API = {
     };
     const jsonBody = JSON.stringify(data);
 
-    // ── MIT App Inventor detected → use bridge ──────────────────
-    if (_isMITAppInventor()) {
+    // ── MIT App Inventor bridge (only if Web component is wired) ─
+    // _isMITAppInventor() alone is not enough — the bridge only
+    // works if the MIT App Inventor project has a Web component
+    // with blocks that handle API_CALL messages.
+    // For plain WebViewer usage, skip the bridge and use fetch/XHR.
+    if (_isMITAppInventor() && typeof window._mitBridgeEnabled !== 'undefined' && window._mitBridgeEnabled === true) {
       return await _callViaMIT(data);
     }
 
-    // ── Strategy 1: fetch POST ──────────────────────────────────
+    // ── Strategy 1: fetch GET (most compatible — works in Android
+    //    WebView, MIT WebViewer, Chrome, Safari, all browsers) ────
+    if (typeof fetch !== 'undefined') {
+      try {
+        const url = CONFIG.API_URL + '?payload=' + encodeURIComponent(jsonBody);
+        const res = await fetch(url, { method: 'GET', redirect: 'follow' });
+        const text = await res.text();
+        if (text && text.trim().charAt(0) === '{') {
+          return JSON.parse(text);
+        }
+      } catch(e) {
+        console.warn('fetch GET failed:', e.message);
+      }
+    }
+
+    // ── Strategy 2: fetch POST ──────────────────────────────────
     if (typeof fetch !== 'undefined') {
       try {
         const res = await fetch(CONFIG.API_URL, {
@@ -366,33 +385,19 @@ const API = {
       }
     }
 
-    // ── Strategy 2: fetch GET ───────────────────────────────────
-    if (typeof fetch !== 'undefined') {
-      try {
-        const url = CONFIG.API_URL + '?payload=' + encodeURIComponent(jsonBody);
-        const res = await fetch(url, { method: 'GET', redirect: 'follow' });
-        const text = await res.text();
-        if (text && text.trim().charAt(0) === '{') {
-          return JSON.parse(text);
-        }
-      } catch(e) {
-        console.warn('fetch GET failed:', e.message);
-      }
-    }
-
-    // ── Strategy 3: XHR POST ────────────────────────────────────
-    const xhrPost = await _xhrRequest(CONFIG.API_URL, 'POST', jsonBody);
-    if (xhrPost) return xhrPost;
-
-    // ── Strategy 4: XHR GET ─────────────────────────────────────
+    // ── Strategy 3: XHR GET ─────────────────────────────────────
     const getUrl = CONFIG.API_URL + '?payload=' + encodeURIComponent(jsonBody);
     const xhrGet = await _xhrRequest(getUrl, 'GET', null);
     if (xhrGet) return xhrGet;
 
+    // ── Strategy 4: XHR POST ────────────────────────────────────
+    const xhrPost = await _xhrRequest(CONFIG.API_URL, 'POST', jsonBody);
+    if (xhrPost) return xhrPost;
+
     const ua = navigator.userAgent || '';
     return {
       success: false,
-      message: 'Cannot reach server. Tried POST + GET + XHR. UA: ' + ua.substring(0, 60)
+      message: 'Cannot reach server. Check internet connection. UA: ' + ua.substring(0, 60)
     };
   },
   login: (username, password) => API.call('login', { username, password }),
