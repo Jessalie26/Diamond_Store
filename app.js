@@ -703,18 +703,7 @@ function showAppShell() {
 }
 
 function navigateTo(section) {
-  // Allow navigation even if session check is momentarily delayed on mobile
-  if (!Auth.isLoggedIn()) {
-    // Give storage one more chance before redirecting to login
-    setTimeout(function() {
-      if (Auth.isLoggedIn()) {
-        navigateTo(section);
-      } else {
-        showLoginView();
-      }
-    }, 150);
-    return;
-  }
+  if (!Auth.isLoggedIn()) { showLoginView(); return; }
 
   // RBAC guard
   if (ADMIN_ONLY_SECTIONS.has(section) && !Auth.isAdmin()) {
@@ -2384,38 +2373,60 @@ async function handleLogin(e) {
 
 function _launchApp() {
   try {
-    // Hide login, show app
+    _pendingSession = null;
+
+    // Directly manipulate DOM — do NOT rely on Auth.isLoggedIn() here
+    // because Android localStorage may have a write delay after setSession.
     var loginView = document.getElementById('loginView');
     var appShell  = document.getElementById('appShell');
     if (loginView) loginView.style.display = 'none';
     if (appShell)  appShell.style.display  = 'block';
 
-    _pendingSession = null;
-    initProtectedPage();
+    // Setup sidebar, RBAC, logout button
+    try { populateSidebarUser(); } catch(e) {}
+    try { applyRBAC(); }          catch(e) {}
+    try { initLogoutButton(); }   catch(e) {}
+    try { initSidebarToggle(); }  catch(e) {}
 
-    // Small delay on mobile to let DOM settle before loading data
-    setTimeout(function() {
-      try {
-        navigateTo('dashboard');
-      } catch(navErr) {
-        console.error('navigateTo error:', navErr);
-        // Force dashboard view visible even if navigateTo fails
-        var dv = document.getElementById('dashboardView');
-        if (dv) dv.style.display = 'block';
-        try { loadDashboard(); } catch(e) {}
+    // Hide all views, show dashboard directly
+    var views = ['dashboardView','posView','productsView','stockInView',
+                 'suppliersView','spoilageView','reportsView','auditLogsView','usersView'];
+    views.forEach(function(id) {
+      var el = document.getElementById(id);
+      if (el) el.style.display = 'none';
+    });
+    var dashView = document.getElementById('dashboardView');
+    if (dashView) dashView.style.display = 'block';
+
+    // Update header title
+    var headerTitle = document.getElementById('headerTitle');
+    if (headerTitle) headerTitle.textContent = 'Dashboard';
+
+    // Mark Dashboard nav active
+    document.querySelectorAll('.nav-item').forEach(function(item) {
+      item.classList.toggle('active', item.dataset.section === 'dashboard');
+    });
+
+    // Load dashboard data
+    try { loadDashboard(); } catch(e) {}
+
+    // Wire up sidebar nav clicks
+    document.querySelectorAll('.nav-item[data-section]').forEach(function(item) {
+      if (!item._navBound) {
+        item._navBound = true;
+        item.addEventListener('click', function() {
+          navigateTo(item.dataset.section);
+        });
       }
-    }, 80);
+    });
 
   } catch(err) {
     console.error('_launchApp error:', err);
-    // Last resort: force show dashboard
+    // Last resort — force show dashboard anyway
     try {
-      var ls = document.getElementById('loginView');
-      var as = document.getElementById('appShell');
-      if (ls) ls.style.display = 'none';
-      if (as) as.style.display = 'block';
-      var dv = document.getElementById('dashboardView');
-      if (dv) dv.style.display = 'block';
+      document.getElementById('loginView').style.display = 'none';
+      document.getElementById('appShell').style.display  = 'block';
+      document.getElementById('dashboardView').style.display = 'block';
     } catch(e) {}
   }
 }
