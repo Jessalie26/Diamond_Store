@@ -703,7 +703,18 @@ function showAppShell() {
 }
 
 function navigateTo(section) {
-  if (!Auth.isLoggedIn()) { showLoginView(); return; }
+  // Allow navigation even if session check is momentarily delayed on mobile
+  if (!Auth.isLoggedIn()) {
+    // Give storage one more chance before redirecting to login
+    setTimeout(function() {
+      if (Auth.isLoggedIn()) {
+        navigateTo(section);
+      } else {
+        showLoginView();
+      }
+    }, 150);
+    return;
+  }
 
   // RBAC guard
   if (ADMIN_ONLY_SECTIONS.has(section) && !Auth.isAdmin()) {
@@ -2373,20 +2384,38 @@ async function handleLogin(e) {
 
 function _launchApp() {
   try {
-    showAppShell();
-    initProtectedPage();
-    navigateTo('dashboard');
+    // Hide login, show app
+    var loginView = document.getElementById('loginView');
+    var appShell  = document.getElementById('appShell');
+    if (loginView) loginView.style.display = 'none';
+    if (appShell)  appShell.style.display  = 'block';
+
     _pendingSession = null;
+    initProtectedPage();
+
+    // Small delay on mobile to let DOM settle before loading data
+    setTimeout(function() {
+      try {
+        navigateTo('dashboard');
+      } catch(navErr) {
+        console.error('navigateTo error:', navErr);
+        // Force dashboard view visible even if navigateTo fails
+        var dv = document.getElementById('dashboardView');
+        if (dv) dv.style.display = 'block';
+        try { loadDashboard(); } catch(e) {}
+      }
+    }, 80);
+
   } catch(err) {
-    // Fallback: if any init step throws, still show the app shell
     console.error('_launchApp error:', err);
+    // Last resort: force show dashboard
     try {
-      showAppShell();
-      _pendingSession = null;
-      // Try navigating to dashboard one more time
-      setTimeout(function() {
-        try { navigateTo('dashboard'); } catch(e) {}
-      }, 100);
+      var ls = document.getElementById('loginView');
+      var as = document.getElementById('appShell');
+      if (ls) ls.style.display = 'none';
+      if (as) as.style.display = 'block';
+      var dv = document.getElementById('dashboardView');
+      if (dv) dv.style.display = 'block';
     } catch(e) {}
   }
 }
