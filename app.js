@@ -262,31 +262,46 @@ function infoRow(label, value) {
 // CORS preflight and follows GAS redirects correctly on Android.
 // ============================================================
 
-// Core transport: plain XHR, no custom headers, GET only
-// This is the most compatible method across all WebViews.
+// Core transport: plain XHR GET, no custom headers.
+// Uses BOTH onload AND onreadystatechange for maximum
+// compatibility across all Android WebView versions (4.4 → 14).
 function _xhrGET(url) {
   return new Promise(function(resolve) {
+    var settled = false;
+    function done(val) {
+      if (settled) return;
+      settled = true;
+      resolve(val);
+    }
     try {
       var xhr = new XMLHttpRequest();
       xhr.open('GET', url, true);
       // NO custom headers — avoids CORS preflight on Android WebView
       xhr.timeout = 25000;
+
+      // onload — fires on modern Android WebView (Android 7+)
       xhr.onload = function() {
         try {
-          var text = xhr.responseText || '';
-          var trimmed = text.trim();
-          if (trimmed.charAt(0) === '{') {
-            resolve(JSON.parse(trimmed));
-          } else {
-            resolve(null);
-          }
-        } catch(e) { resolve(null); }
+          var trimmed = (xhr.responseText || '').trim();
+          done(trimmed.charAt(0) === '{' ? JSON.parse(trimmed) : null);
+        } catch(e) { done(null); }
       };
-      xhr.onerror   = function() { resolve(null); };
-      xhr.ontimeout = function() { resolve(null); };
-      xhr.onabort   = function() { resolve(null); };
+
+      // onreadystatechange — fires on older Android WebView (4.4–6)
+      xhr.onreadystatechange = function() {
+        if (xhr.readyState === 4) {
+          try {
+            var trimmed = (xhr.responseText || '').trim();
+            done(trimmed.charAt(0) === '{' ? JSON.parse(trimmed) : null);
+          } catch(e) { done(null); }
+        }
+      };
+
+      xhr.onerror   = function() { done(null); };
+      xhr.ontimeout = function() { done(null); };
+      xhr.onabort   = function() { done(null); };
       xhr.send(null);
-    } catch(e) { resolve(null); }
+    } catch(e) { done(null); }
   });
 }
 
