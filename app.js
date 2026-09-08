@@ -252,7 +252,63 @@ function infoRow(label, value) {
 // API / GOOGLE APPS SCRIPT
 // ===============================
 
-// XHR fallback for environments where fetch is unavailable
+// ============================================================
+// API TRANSPORT — works on Desktop, Mobile Chrome, Safari,
+// and MIT App Inventor WebViewer (no MIT blocks required).
+//
+// Root cause of WebViewer hang: fetch() with redirect:'follow'
+// fails silently on Android WebView for cross-origin GAS URLs.
+// Solution: plain XHR GET with no custom headers — this bypasses
+// CORS preflight and follows GAS redirects correctly on Android.
+// ============================================================
+
+// Core transport: plain XHR, no custom headers, GET only
+// This is the most compatible method across all WebViews.
+function _xhrGET(url) {
+  return new Promise(function(resolve) {
+    try {
+      var xhr = new XMLHttpRequest();
+      xhr.open('GET', url, true);
+      // NO custom headers — avoids CORS preflight on Android WebView
+      xhr.timeout = 25000;
+      xhr.onload = function() {
+        try {
+          var text = xhr.responseText || '';
+          var trimmed = text.trim();
+          if (trimmed.charAt(0) === '{') {
+            resolve(JSON.parse(trimmed));
+          } else {
+            resolve(null);
+          }
+        } catch(e) { resolve(null); }
+      };
+      xhr.onerror   = function() { resolve(null); };
+      xhr.ontimeout = function() { resolve(null); };
+      xhr.onabort   = function() { resolve(null); };
+      xhr.send(null);
+    } catch(e) { resolve(null); }
+  });
+}
+
+// Secondary transport: fetch GET, used on desktop as confirmation
+function _fetchGET(url) {
+  return new Promise(function(resolve) {
+    if (typeof fetch === 'undefined') { resolve(null); return; }
+    var timer = setTimeout(function() { resolve(null); }, 25000);
+    fetch(url, { method: 'GET', redirect: 'follow', cache: 'no-store' })
+      .then(function(res) { return res.text(); })
+      .then(function(text) {
+        clearTimeout(timer);
+        var trimmed = (text || '').trim();
+        if (trimmed.charAt(0) === '{') {
+          try { resolve(JSON.parse(trimmed)); } catch(e) { resolve(null); }
+        } else { resolve(null); }
+      })
+      .catch(function() { clearTimeout(timer); resolve(null); });
+  });
+}
+
+// Legacy XHR fallback for environments where fetch is unavailable
 function _xhrRequest(url, method, body) {
   return new Promise(function(resolve) {
     try {
@@ -275,17 +331,17 @@ function _xhrRequest(url, method, body) {
       };
       xhr.onerror   = function() { resolve(null); };
       xhr.ontimeout = function() { resolve(null); };
-      xhr.timeout = 30000;
+      xhr.timeout = 25000;
       xhr.send(body || null);
     } catch(e) { resolve(null); }
   });
 }
 
-// MIT App Inventor bridge — resolvers waiting for response
+// MIT App Inventor bridge — only used if explicitly wired in blocks
+// (NOT required for normal WebViewer usage)
 const _mitResolvers = {};
 let _mitCallId = 0;
 
-// Called by MIT App Inventor blocks when API response arrives
 function _onMITResponse(jsonStr) {
   try {
     const obj = JSON.parse(jsonStr);
@@ -297,38 +353,32 @@ function _onMITResponse(jsonStr) {
   } catch(e) {}
 }
 
-// Detect if running inside MIT App Inventor WebView
 function _isMITAppInventor() {
   return typeof window.AppInventor !== 'undefined' ||
          navigator.userAgent.indexOf('MIT-AI2App') !== -1 ||
          navigator.userAgent.indexOf('AppInventor') !== -1;
 }
 
-// Send API call via MIT App Inventor Web component
 function _callViaMIT(data) {
   return new Promise(function(resolve) {
     const callId = ++_mitCallId;
     _mitResolvers[callId] = resolve;
     data._callId = callId;
-    // Timeout after 30s
     setTimeout(function() {
       if (_mitResolvers[callId]) {
         delete _mitResolvers[callId];
         resolve({ success: false, message: 'Request timed out.' });
       }
-    }, 30000);
+    }, 25000);
     try {
-      // Send to MIT App Inventor via WebViewString
       const payload = JSON.stringify({
-        type: 'API_CALL',
-        callId: callId,
-        url: CONFIG.API_URL,
-        data: JSON.stringify(data)
+        type: 'API_CALL', callId: callId,
+        url: CONFIG.API_URL, data: JSON.stringify(data)
       });
       window.AppInventor.setWebViewString(payload);
     } catch(e) {
       delete _mitResolvers[callId];
-      resolve({ success: false, message: 'MIT App Inventor bridge error: ' + e.message });
+      resolve({ success: false, message: 'MIT bridge error: ' + e.message });
     }
   });
 }
@@ -342,41 +392,44 @@ const API = {
       ...payload
     };
     const jsonBody = JSON.stringify(data);
+    const cacheBust = '&_t=' + Date.now();
+    const getUrl = CONFIG.API_URL + '?payload=' + encodeURIComponent(jsonBody) + cacheBust;
 
-    // ── MIT App Inventor bridge (only if Web component is wired) ─
-    // _isMITAppInventor() alone is not enough — the bridge only
-    // works if the MIT App Inventor project has a Web component
-    // with blocks that handle API_CALL messages.
-    // For plain WebViewer usage, skip the bridge and use fetch/XHR.
-    if (_isMITAppInventor() && typeof window._mitBridgeEnabled !== 'undefined' && window._mitBridgeEnabled === true) {
+    // ── MIT bridge — ONLY if explicitly enabled via blocks ───────
+    // window._mitBridgeEnabled must be set to true in MIT blocks.
+    // For plain WebViewer (no blocks), this is NEVER triggered.
+    if (window._mitBridgeEnabled === true) {
       return await _callViaMIT(data);
     }
 
-    // ── Strategy 1: fetch GET (most compatible — works in Android
-    //    WebView, MIT WebViewer, Chrome, Safari, all browsers) ────
-    if (typeof fetch !== 'undefined') {
-      try {
-        const url = CONFIG.API_URL + '?payload=' + encodeURIComponent(jsonBody);
-        const res = await fetch(url, { method: 'GET', redirect: 'follow' });
-        const text = await res.text();
-        if (text && text.trim().charAt(0) === '{') {
-          return JSON.parse(text);
-        }
-      } catch(e) {
-        console.warn('fetch GET failed:', e.message);
-      }
-    }
+    // ── Primary: plain XHR GET ───────────────────────────────────
+    // No custom headers → no CORS preflight → works on all Android
+    // WebViews including MIT AI2 Companion. GAS handles GET payload
+    // via doGet(e.parameter.payload).
+    var result = await _xhrGET(getUrl);
+    if (result) return result;
 
-    // ── Strategy 2: fetch POST ──────────────────────────────────
+    // ── Secondary: fetch GET ─────────────────────────────────────
+    // Works on desktop Chrome/Safari/Firefox. May fail on some
+    // Android WebViews due to redirect handling — XHR is primary.
+    result = await _fetchGET(getUrl);
+    if (result) return result;
+
+    // ── Tertiary: fetch POST ─────────────────────────────────────
     if (typeof fetch !== 'undefined') {
       try {
-        const res = await fetch(CONFIG.API_URL, {
+        var controller = new AbortController();
+        var timer = setTimeout(function() { controller.abort(); }, 25000);
+        var res = await fetch(CONFIG.API_URL, {
           method: 'POST',
           headers: { 'Content-Type': 'text/plain;charset=utf-8' },
           body: jsonBody,
-          redirect: 'follow'
+          redirect: 'follow',
+          cache: 'no-store',
+          signal: controller.signal
         });
-        const text = await res.text();
+        clearTimeout(timer);
+        var text = await res.text();
         if (text && text.trim().charAt(0) === '{') {
           return JSON.parse(text);
         }
@@ -385,19 +438,14 @@ const API = {
       }
     }
 
-    // ── Strategy 3: XHR GET ─────────────────────────────────────
-    const getUrl = CONFIG.API_URL + '?payload=' + encodeURIComponent(jsonBody);
-    const xhrGet = await _xhrRequest(getUrl, 'GET', null);
-    if (xhrGet) return xhrGet;
+    // ── Final fallback: XHR POST ─────────────────────────────────
+    result = await _xhrRequest(CONFIG.API_URL, 'POST', jsonBody);
+    if (result) return result;
 
-    // ── Strategy 4: XHR POST ────────────────────────────────────
-    const xhrPost = await _xhrRequest(CONFIG.API_URL, 'POST', jsonBody);
-    if (xhrPost) return xhrPost;
-
-    const ua = navigator.userAgent || '';
+    // ── All strategies failed ────────────────────────────────────
     return {
       success: false,
-      message: 'Cannot reach server. Check internet connection. UA: ' + ua.substring(0, 60)
+      message: 'Unable to connect to server. Please check your internet connection.'
     };
   },
   login: (username, password) => API.call('login', { username, password }),
@@ -2196,24 +2244,32 @@ async function handleLogin(e) {
 
   const btn = document.getElementById('loginBtn');
   btn.disabled = true;
-  btn.innerHTML = '<div class="spin"></div> Connecting…';
+  btn.innerHTML = '<div class="spin"></div> Signing in…';
 
-  // Show visible status on mobile for debugging
-  let res;
-  try {
-    btn.innerHTML = '<div class="spin"></div> Reaching server…';
-    res = await API.login(u, p);
-  } catch(err) {
+  // Hard safety timeout — button NEVER stays stuck beyond 30s
+  const safetyTimer = setTimeout(function() {
     btn.disabled = false;
     btn.innerHTML = 'Sign In';
-    showLoginErr('Connection error: ' + err.message);
+    showLoginErr('Unable to connect to server. Please check your internet connection.');
+  }, 30000);
+
+  let res;
+  try {
+    res = await API.login(u, p);
+  } catch(err) {
+    clearTimeout(safetyTimer);
+    btn.disabled = false;
+    btn.innerHTML = 'Sign In';
+    showLoginErr('Connection error: ' + (err.message || 'Unknown error'));
     return;
   }
+
+  clearTimeout(safetyTimer);
 
   if (!res) {
     btn.disabled = false;
     btn.innerHTML = 'Sign In';
-    showLoginErr('No response from server. Check internet connection.');
+    showLoginErr('No response from server. Please check your internet connection.');
     return;
   }
 
@@ -2236,11 +2292,9 @@ async function handleLogin(e) {
     const stored  = localStorage.getItem(PIN_KEY);
 
     if (!stored) {
-      // First login – no PIN set yet → go to setup step
       showStep(3);
       initSetPinPad(PIN_KEY);
     } else {
-      // PIN exists → ask for it
       showStep(2);
       initPinPad(PIN_KEY);
     }
