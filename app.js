@@ -411,57 +411,80 @@ const API = {
     const getUrl = CONFIG.API_URL + '?payload=' + encodeURIComponent(jsonBody) + cacheBust;
 
     // ── MIT bridge — ONLY if explicitly enabled via blocks ───────
-    // window._mitBridgeEnabled must be set to true in MIT blocks.
-    // For plain WebViewer (no blocks), this is NEVER triggered.
     if (window._mitBridgeEnabled === true) {
       return await _callViaMIT(data);
     }
 
-    // ── Primary: plain XHR GET ───────────────────────────────────
-    // No custom headers → no CORS preflight → works on all Android
-    // WebViews including MIT AI2 Companion. GAS handles GET payload
-    // via doGet(e.parameter.payload).
-    var result = await _xhrGET(getUrl);
-    if (result) return result;
+    // ── Race all transport strategies simultaneously ──────────────
+    // First valid JSON response wins. Hard 15-second deadline.
+    // Eliminates the 25s+25s sequential wait that caused hanging.
+    return new Promise(function(outerResolve) {
+      var done      = false;
+      var pending   = 0;
+      var deadline  = null;
 
-    // ── Secondary: fetch GET ─────────────────────────────────────
-    // Works on desktop Chrome/Safari/Firefox. May fail on some
-    // Android WebViews due to redirect handling — XHR is primary.
-    result = await _fetchGET(getUrl);
-    if (result) return result;
-
-    // ── Tertiary: fetch POST ─────────────────────────────────────
-    if (typeof fetch !== 'undefined') {
-      try {
-        var controller = new AbortController();
-        var timer = setTimeout(function() { controller.abort(); }, 25000);
-        var res = await fetch(CONFIG.API_URL, {
-          method: 'POST',
-          headers: { 'Content-Type': 'text/plain;charset=utf-8' },
-          body: jsonBody,
-          redirect: 'follow',
-          cache: 'no-store',
-          signal: controller.signal
-        });
-        clearTimeout(timer);
-        var text = await res.text();
-        if (text && text.trim().charAt(0) === '{') {
-          return JSON.parse(text);
+      function finish(result) {
+        if (done) return;
+        if (result && typeof result === 'object' && ('success' in result)) {
+          done = true;
+          clearTimeout(deadline);
+          outerResolve(result);
+        } else {
+          pending--;
+          if (pending <= 0) {
+            done = true;
+            clearTimeout(deadline);
+            outerResolve({
+              success: false,
+              message: 'Unable to connect to server. Please check your internet connection.'
+            });
+          }
         }
-      } catch(e) {
-        console.warn('fetch POST failed:', e.message);
       }
-    }
 
-    // ── Final fallback: XHR POST ─────────────────────────────────
-    result = await _xhrRequest(CONFIG.API_URL, 'POST', jsonBody);
-    if (result) return result;
+      function wrap(promise) {
+        pending++;
+        promise
+          .then(function(r) { finish(r); })
+          .catch(function()  { finish(null); });
+      }
 
-    // ── All strategies failed ────────────────────────────────────
-    return {
-      success: false,
-      message: 'Unable to connect to server. Please check your internet connection.'
-    };
+      // 15-second hard deadline
+      deadline = setTimeout(function() {
+        if (!done) {
+          done = true;
+          outerResolve({
+            success: false,
+            message: 'Server is not responding. Please check your internet connection.'
+          });
+        }
+      }, 15000);
+
+      // Fire GET strategies immediately (most compatible on Android)
+      wrap(_xhrGET(getUrl));
+      wrap(_fetchGET(getUrl));
+
+      // Fire POST strategies 500ms later (GET usually wins faster)
+      setTimeout(function() {
+        if (done) return;
+        wrap(_xhrRequest(CONFIG.API_URL, 'POST', jsonBody));
+        if (typeof fetch !== 'undefined') {
+          var p = fetch(CONFIG.API_URL, {
+            method: 'POST',
+            headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+            body: jsonBody,
+            redirect: 'follow',
+            cache: 'no-store'
+          }).then(function(r) { return r.text(); })
+            .then(function(t) {
+              var trimmed = (t || '').trim();
+              return trimmed.charAt(0) === '{' ? JSON.parse(trimmed) : null;
+            })
+            .catch(function() { return null; });
+          wrap(p);
+        }
+      }, 500);
+    });
   },
   login: (username, password) => API.call('login', { username, password }),
   logout: (userId, username, role) => API.call('logout', { userId, username, role }),
@@ -2261,12 +2284,12 @@ async function handleLogin(e) {
   btn.disabled = true;
   btn.innerHTML = '<div class="spin"></div> Signing in…';
 
-  // Hard safety timeout — button NEVER stays stuck beyond 30s
+  // Hard safety timeout — button NEVER stays stuck beyond 18s
   const safetyTimer = setTimeout(function() {
     btn.disabled = false;
     btn.innerHTML = 'Sign In';
     showLoginErr('Unable to connect to server. Please check your internet connection.');
-  }, 30000);
+  }, 18000);
 
   let res;
   try {
