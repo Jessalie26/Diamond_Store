@@ -4,6 +4,24 @@
 // ============================================================
 
 // ===============================
+// SAFE STORAGE
+// Must be defined first — used by Auth, brute-force, and PIN.
+// Some Android WebViews (private/restricted mode) block localStorage.
+// SafeStorage wraps every call so it NEVER throws.
+// ===============================
+var SafeStorage = {
+  get: function(key) {
+    try { return localStorage.getItem(key); } catch(e) { return null; }
+  },
+  set: function(key, value) {
+    try { localStorage.setItem(key, value); return true; } catch(e) { return false; }
+  },
+  remove: function(key) {
+    try { localStorage.removeItem(key); } catch(e) {}
+  }
+};
+
+// ===============================
 // CONFIGURATION
 // ===============================
 
@@ -525,8 +543,8 @@ const API = {
 const Auth = {
   getSession() {
     try {
-      // Use localStorage — sessionStorage is blocked in MIT App Inventor WebView
-      const raw = localStorage.getItem(CONFIG.SESSION_KEY);
+      // Use SafeStorage — localStorage is blocked in some Android WebViews
+      const raw = SafeStorage.get(CONFIG.SESSION_KEY);
       if (!raw) return null;
       const parsed = JSON.parse(raw);
       if (!parsed || !parsed.token || !parsed.user) return null;
@@ -534,10 +552,10 @@ const Auth = {
     } catch { return null; }
   },
   setSession(data) {
-    try { localStorage.setItem(CONFIG.SESSION_KEY, JSON.stringify(data)); } catch(e) {}
+    SafeStorage.set(CONFIG.SESSION_KEY, JSON.stringify(data));
   },
   clearSession() {
-    try { localStorage.removeItem(CONFIG.SESSION_KEY); } catch(e) {}
+    SafeStorage.remove(CONFIG.SESSION_KEY);
   },
   isLoggedIn() { return !!this.getSession(); },
   getUser() { const s = this.getSession(); return s ? s.user : null; },
@@ -2203,8 +2221,8 @@ const MAX_ATTEMPTS = 5;
 const COOLDOWN_MS  = 30 * 1000;
 const BF_KEY       = 'ds_bf';
 
-function getBF()   { try { return JSON.parse(localStorage.getItem(BF_KEY)) || {n:0,until:0}; } catch { return {n:0,until:0}; } }
-function saveBF(s) { localStorage.setItem(BF_KEY, JSON.stringify(s)); }
+function getBF()   { try { return JSON.parse(SafeStorage.get(BF_KEY)) || {n:0,until:0}; } catch(e) { return {n:0,until:0}; } }
+function saveBF(s) { SafeStorage.set(BF_KEY, JSON.stringify(s)); }
 function isLocked()  { return getBF().until > Date.now(); }
 function secsLeft()  { return Math.max(0, Math.ceil((getBF().until - Date.now()) / 1000)); }
 
@@ -2327,7 +2345,7 @@ async function handleLogin(e) {
     _pendingSession = { token: res.token, user: res.user };
 
     const PIN_KEY = 'ds_apin_' + res.user.userID;
-    const stored  = localStorage.getItem(PIN_KEY);
+    const stored  = SafeStorage.get(PIN_KEY);
 
     if (!stored) {
       showStep(3);
@@ -2354,32 +2372,46 @@ async function handleLogin(e) {
 }
 
 function _launchApp() {
-  showAppShell();
-  initProtectedPage();
-  navigateTo('dashboard');
-  _pendingSession = null;
+  try {
+    showAppShell();
+    initProtectedPage();
+    navigateTo('dashboard');
+    _pendingSession = null;
+  } catch(err) {
+    // Fallback: if any init step throws, still show the app shell
+    console.error('_launchApp error:', err);
+    try {
+      showAppShell();
+      _pendingSession = null;
+      // Try navigating to dashboard one more time
+      setTimeout(function() {
+        try { navigateTo('dashboard'); } catch(e) {}
+      }, 100);
+    } catch(e) {}
+  }
 }
 
-// ── PIN hash – pure JS, works on HTTP/WebView/MIT App Inventor ─
+// ── PIN hash – compatible with all Android WebViews ──────────
+// Uses basic arithmetic only — no Math.imul, no padStart
 function hashPIN(pin) {
-  // Simple but consistent hash: djb2 + salt, returned as hex string
-  // Not cryptographic-grade but sufficient for a local 4-digit PIN
-  const str = pin + 'ds_diamond_salt_2025';
-  let h1 = 0x6A4C3B2D, h2 = 0xD3E2F1A0;
-  for (let i = 0; i < str.length; i++) {
-    const c = str.charCodeAt(i);
-    h1 = Math.imul(h1 ^ c, 0x9E3779B9);
-    h1 = (h1 << 13) | (h1 >>> 19);
-    h2 = Math.imul(h2 ^ c, 0x85EBCA77);
-    h2 = (h2 << 7)  | (h2 >>> 25);
+  var str = pin + 'ds_diamond_salt_2025';
+  var hash1 = 0x6A4C3B2D;
+  var hash2 = 0xD3E2F1A0;
+  for (var i = 0; i < str.length; i++) {
+    var c = str.charCodeAt(i);
+    hash1 = ((hash1 ^ c) * 0x9E3779B9) & 0xFFFFFFFF;
+    hash1 = ((hash1 << 13) | (hash1 >>> 19)) & 0xFFFFFFFF;
+    hash2 = ((hash2 ^ c) * 0x85EBCA77) & 0xFFFFFFFF;
+    hash2 = ((hash2 << 7) | (hash2 >>> 25)) & 0xFFFFFFFF;
   }
-  h1 ^= h2; h2 ^= h1;
-  h1 = Math.imul(h1 ^ (h1 >>> 16), 0x45D9F3B);
-  h1 = Math.imul(h1 ^ (h1 >>> 16), 0x45D9F3B);
-  h2 = Math.imul(h2 ^ (h2 >>> 16), 0x45D9F3B);
-  h2 = Math.imul(h2 ^ (h2 >>> 16), 0x45D9F3B);
-  const toHex = n => (n >>> 0).toString(16).padStart(8, '0');
-  return toHex(h1) + toHex(h2);
+  hash1 = (hash1 ^ hash2) & 0xFFFFFFFF;
+  hash2 = (hash2 ^ hash1) & 0xFFFFFFFF;
+  function toHex(n) {
+    var s = (n >>> 0).toString(16);
+    while (s.length < 8) s = '0' + s;
+    return s;
+  }
+  return toHex(hash1) + toHex(hash2);
 }
 
 // ── PIN Pad: Verify ───────────────────────────────────────────
@@ -2410,7 +2442,7 @@ function initPinPad(storageKey) {
       : msg;
     if (errMsg) errMsg.textContent = fullMsg;
     if (pinAttempts >= 3) {
-      localStorage.removeItem(storageKey);
+      SafeStorage.remove(storageKey);
       setTimeout(() => {
         showStep(3);
         initSetPinPad(storageKey);
@@ -2447,7 +2479,7 @@ function initPinPad(storageKey) {
 
     if (entered.length === 4) {
       const hashed = hashPIN(entered);
-      const stored = localStorage.getItem(storageKey);
+      const stored = SafeStorage.get(storageKey);
       if (hashed === stored) {
         Auth.setSession(_pendingSession);
         _launchApp();
@@ -2479,7 +2511,7 @@ function initPinPad(storageKey) {
         'Reset Security PIN',
         'This will delete your current PIN. You will need to set a new one on your next login. Continue?',
         () => {
-          localStorage.removeItem(storageKey);
+          SafeStorage.remove(storageKey);
           _pendingSession = null;
           entered = '';
           Toast.success('PIN Reset', 'Your PIN has been cleared. Please log in again to set a new one.');
@@ -2537,7 +2569,7 @@ function initSetPinPad(storageKey) {
       } else {
         if (entered === firstPin) {
           const hashed = hashPIN(entered);
-          localStorage.setItem(storageKey, hashed);
+          SafeStorage.set(storageKey, hashed);
           Auth.setSession(_pendingSession);
           _launchApp();
         } else {
