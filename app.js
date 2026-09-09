@@ -540,21 +540,33 @@ const API = {
 // AUTHENTICATION
 // ===============================
 
+// In-memory session cache — prevents Android localStorage timing issues.
+// setSession writes both to memory and localStorage.
+// getSession reads memory first, falls back to localStorage.
+var _sessionCache = null;
+
 const Auth = {
   getSession() {
+    // 1. Return in-memory cache first (always reliable, no storage delay)
+    if (_sessionCache && _sessionCache.token && _sessionCache.user) {
+      return _sessionCache;
+    }
+    // 2. Fall back to localStorage
     try {
-      // Use SafeStorage — localStorage is blocked in some Android WebViews
       const raw = SafeStorage.get(CONFIG.SESSION_KEY);
       if (!raw) return null;
       const parsed = JSON.parse(raw);
       if (!parsed || !parsed.token || !parsed.user) return null;
+      _sessionCache = parsed; // warm the cache
       return parsed;
-    } catch { return null; }
+    } catch(e) { return null; }
   },
   setSession(data) {
-    SafeStorage.set(CONFIG.SESSION_KEY, JSON.stringify(data));
+    _sessionCache = data;                                    // in-memory first
+    SafeStorage.set(CONFIG.SESSION_KEY, JSON.stringify(data)); // persist
   },
   clearSession() {
+    _sessionCache = null;
     SafeStorage.remove(CONFIG.SESSION_KEY);
   },
   isLoggedIn() { return !!this.getSession(); },
@@ -765,13 +777,37 @@ function initModule(section) {
 
 async function loadDashboard() {
   showDashboardSkeleton();
-  const result = await API.getDashboardStats();
-  if (!result.success) { Toast.error('Error', result.message); return; }
-  const d = result.data;
-  renderStatCards(d);
-  renderLowStockAlerts(d.lowStockProducts);
-  renderRecentSales(d.recentSales);
-  renderInventorySummary(d.inventorySummary);
+  try {
+    const result = await API.getDashboardStats();
+    if (!result || !result.success) {
+      // Show zeros instead of "..." so mobile users see data state
+      ['statTotalProducts','statTotalStock','statTodaySales','statTodayRevenue',
+       'statTodayStockIn','statTodaySpoil'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = '0';
+      });
+      const lowStockList = document.getElementById('lowStockList');
+      if (lowStockList) lowStockList.innerHTML = '<div class="empty-state"><p>Could not load data.</p></div>';
+      const rsTbody = document.getElementById('recentSalesBody');
+      if (rsTbody) rsTbody.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:1rem">No data.</td></tr>';
+      const isTbody = document.getElementById('inventorySummaryBody');
+      if (isTbody) isTbody.innerHTML = '<tr><td colspan="5" style="text-align:center;padding:1rem">No data.</td></tr>';
+      if (result && result.message) Toast.error('Dashboard', result.message);
+      return;
+    }
+    const d = result.data;
+    renderStatCards(d);
+    renderLowStockAlerts(d.lowStockProducts);
+    renderRecentSales(d.recentSales);
+    renderInventorySummary(d.inventorySummary);
+  } catch(err) {
+    console.error('loadDashboard:', err);
+    ['statTotalProducts','statTotalStock','statTodaySales','statTodayRevenue',
+     'statTodayStockIn','statTodaySpoil'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = '0';
+    });
+  }
 }
 
 function showDashboardSkeleton() {
@@ -874,19 +910,28 @@ async function initPOS() {
 }
 
 async function loadPosProducts() {
-  const result = await API.getProducts();
-  if (!result.success) return;
-  posProducts = (result.data || []).filter(p => p.Status === 'Active');
-  renderProductTiles();
+  try {
+    const result = await API.getProducts();
+    if (!result || !result.success) return;
+    posProducts = (result.data || []).filter(p => p.Status === 'Active');
+    renderProductTiles();
+  } catch(e) { renderProductTiles(); }
 }
 
 async function loadSales() {
   showTableLoading('salesTableBody', 10);
-  const result = await API.getSales();
-  if (!result.success) { Toast.error('Error', result.message); return; }
-  allSales = (result.data || []).sort((a, b) => new Date(b.Date + ' ' + (b.Time||'')) - new Date(a.Date + ' ' + (a.Time||'')));
-  salesPaginator = null;
-  filterSales();
+  try {
+    const result = await API.getSales();
+    if (!result || !result.success) {
+      setHTML('#salesTableBody', '<tr><td colspan="10" style="text-align:center;padding:1.5rem">Could not load sales.</td></tr>');
+      return;
+    }
+    allSales = (result.data || []).sort((a, b) => new Date(b.Date + ' ' + (b.Time||'')) - new Date(a.Date + ' ' + (a.Time||'')));
+    salesPaginator = null;
+    filterSales();
+  } catch(e) {
+    setHTML('#salesTableBody', '<tr><td colspan="10" style="text-align:center;padding:1.5rem">Error loading sales.</td></tr>');
+  }
 }
 
 function renderProductTiles() {
@@ -965,15 +1010,17 @@ async function processSale() {
     };
     const btn = document.getElementById('processSaleBtn');
     btn.disabled = true; btn.textContent = 'Processing…';
-    const result = await API.addSale(sale);
+    try {
+      const result = await API.addSale(sale);
+      if (result.success) {
+        Toast.success('Sale Complete', `Change: ${formatCurrency(result.change)}`);
+        showReceiptModal(selectedPosProduct.RiceName, qty, price, subtotal, payment, result.change, result.id);
+        clearPOS();
+        await loadPosProducts();
+        await loadSales();
+      } else { Toast.error('Error', result.message); }
+    } catch(e) { Toast.error('Error', 'Could not process sale. Check connection.'); }
     btn.disabled = false; btn.textContent = '✅ Process Sale';
-    if (result.success) {
-      Toast.success('Sale Complete', `Change: ${formatCurrency(result.change)}`);
-      showReceiptModal(selectedPosProduct.RiceName, qty, price, subtotal, payment, result.change, result.id);
-      clearPOS();
-      await loadPosProducts();
-      await loadSales();
-    } else { Toast.error('Error', result.message); }
   }, 'success');
 }
 
@@ -1107,12 +1154,19 @@ async function initProducts() {
 async function loadProducts() {
   showTableLoading('productsTableBody', 11);
   allProducts = [];
-  const result = await API.getProducts();
-  if (!result.success) { Toast.error('Error', result.message); return; }
-  allProducts = result.data || [];
-  productPaginator = null;
-  filterProducts();
-  updateProductCount();
+  try {
+    const result = await API.getProducts();
+    if (!result || !result.success) {
+      setHTML('#productsTableBody', '<tr><td colspan="11" style="text-align:center;padding:1.5rem">Could not load products. ' + (result && result.message || '') + '</td></tr>');
+      return;
+    }
+    allProducts = result.data || [];
+    productPaginator = null;
+    filterProducts();
+    updateProductCount();
+  } catch(e) {
+    setHTML('#productsTableBody', '<tr><td colspan="11" style="text-align:center;padding:1.5rem">Error loading products.</td></tr>');
+  }
 }
 
 function updateProductCount() {
@@ -1253,10 +1307,12 @@ async function saveProduct() {
   };
   const btn = document.getElementById('saveProductBtn');
   btn.disabled = true; btn.textContent = 'Saving…';
-  const result = editingProduct ? await API.updateProduct(product) : await API.addProduct(product);
+  try {
+    const result = editingProduct ? await API.updateProduct(product) : await API.addProduct(product);
+    if (result.success) { Toast.success('Success', result.message); closeModal('productModal'); await loadProducts(); }
+    else Toast.error('Error', result.message);
+  } catch(e) { Toast.error('Error', 'Could not save product. Check connection.'); }
   btn.disabled = false; btn.textContent = 'Save Product';
-  if (result.success) { Toast.success('Success', result.message); closeModal('productModal'); await loadProducts(); }
-  else Toast.error('Error', result.message);
 }
 
 async function deleteProduct(id, name) {
@@ -1301,11 +1357,18 @@ async function initStockIn() {
 async function loadStockIns() {
   showTableLoading('stockInTableBody', 10);
   allStockIns = [];
-  const result = await API.getStockIns();
-  if (!result.success) { Toast.error('Error', result.message); return; }
-  allStockIns = (result.data || []).sort((a, b) => new Date(b.Date) - new Date(a.Date));
-  stockInPaginator = null;
-  filterStockIns();
+  try {
+    const result = await API.getStockIns();
+    if (!result || !result.success) {
+      setHTML('#stockInTableBody', '<tr><td colspan="10" style="text-align:center;padding:1.5rem">Could not load stock-in records.</td></tr>');
+      return;
+    }
+    allStockIns = (result.data || []).sort((a, b) => new Date(b.Date) - new Date(a.Date));
+    stockInPaginator = null;
+    filterStockIns();
+  } catch(e) {
+    setHTML('#stockInTableBody', '<tr><td colspan="10" style="text-align:center;padding:1.5rem">Error loading records.</td></tr>');
+  }
 }
 
 async function loadProductsForStockInDropdown() {
@@ -1437,14 +1500,16 @@ async function saveStockIn() {
   };
   const btn = document.getElementById('saveStockInBtn');
   btn.disabled = true; btn.textContent = 'Saving…';
-  const result = editingStockIn ? await API.updateStockIn(stockIn, editingStockIn.Quantity) : await API.addStockIn(stockIn);
+  try {
+    const result = editingStockIn ? await API.updateStockIn(stockIn, editingStockIn.Quantity) : await API.addStockIn(stockIn);
+    if (result.success) {
+      Toast.success('Success', result.message);
+      closeModal('stockInModal');
+      await loadStockIns();
+      await loadProductsForStockInDropdown();
+    } else Toast.error('Error', result.message);
+  } catch(e) { Toast.error('Error', 'Could not save. Check connection.'); }
   btn.disabled = false; btn.textContent = 'Save';
-  if (result.success) {
-    Toast.success('Success', result.message);
-    closeModal('stockInModal');
-    await loadStockIns();
-    await loadProductsForStockInDropdown();
-  } else Toast.error('Error', result.message);
 }
 
 async function deleteStockIn(id, productID, quantity) {
@@ -1485,12 +1550,19 @@ async function initSuppliers() {
 
 async function loadSuppliers() {
   showTableLoading('suppliersTableBody', 7);
-  const result = await API.getSuppliers();
-  if (!result.success) { Toast.error('Error', result.message); return; }
-  allSuppliers = result.data || [];
-  supplierPaginator = null;
-  filterSuppliers();
-  updateSupplierCount();
+  try {
+    const result = await API.getSuppliers();
+    if (!result || !result.success) {
+      setHTML('#suppliersTableBody', '<tr><td colspan="7" style="text-align:center;padding:1.5rem">Could not load suppliers.</td></tr>');
+      return;
+    }
+    allSuppliers = result.data || [];
+    supplierPaginator = null;
+    filterSuppliers();
+    updateSupplierCount();
+  } catch(e) {
+    setHTML('#suppliersTableBody', '<tr><td colspan="7" style="text-align:center;padding:1.5rem">Error loading suppliers.</td></tr>');
+  }
 }
 
 function updateSupplierCount() {
@@ -1567,10 +1639,12 @@ async function saveSupplier() {
   };
   const btn = document.getElementById('saveSupplierBtn');
   btn.disabled = true; btn.textContent = 'Saving…';
-  const result = editingSupplier ? await API.updateSupplier(supplier) : await API.addSupplier(supplier);
+  try {
+    const result = editingSupplier ? await API.updateSupplier(supplier) : await API.addSupplier(supplier);
+    if (result.success) { Toast.success('Success', result.message); closeModal('supplierModal'); await loadSuppliers(); }
+    else Toast.error('Error', result.message);
+  } catch(e) { Toast.error('Error', 'Could not save supplier. Check connection.'); }
   btn.disabled = false; btn.textContent = 'Save Supplier';
-  if (result.success) { Toast.success('Success', result.message); closeModal('supplierModal'); await loadSuppliers(); }
-  else Toast.error('Error', result.message);
 }
 
 async function deleteSupplier(id, name) {
@@ -1611,11 +1685,18 @@ async function initSpoilage() {
 
 async function loadSpoilage() {
   showTableLoading('spoilageTableBody', 8);
-  const result = await API.getSpoilage();
-  if (!result.success) { Toast.error('Error', result.message); return; }
-  allSpoilage = (result.data || []).sort((a, b) => new Date(b.Date) - new Date(a.Date));
-  spoilagePaginator = null;
-  filterSpoilage();
+  try {
+    const result = await API.getSpoilage();
+    if (!result || !result.success) {
+      setHTML('#spoilageTableBody', '<tr><td colspan="8" style="text-align:center;padding:1.5rem">Could not load spoilage records.</td></tr>');
+      return;
+    }
+    allSpoilage = (result.data || []).sort((a, b) => new Date(b.Date) - new Date(a.Date));
+    spoilagePaginator = null;
+    filterSpoilage();
+  } catch(e) {
+    setHTML('#spoilageTableBody', '<tr><td colspan="8" style="text-align:center;padding:1.5rem">Error loading records.</td></tr>');
+  }
 }
 
 async function loadProductsForSpoilageDropdown() {
@@ -1725,14 +1806,16 @@ async function saveSpoilage() {
   };
   const btn = document.getElementById('saveSpoilageBtn');
   btn.disabled = true; btn.textContent = 'Saving…';
-  const result = editingSpoilage ? await API.updateSpoilage(spoilage, editingSpoilage.Quantity) : await API.addSpoilage(spoilage);
+  try {
+    const result = editingSpoilage ? await API.updateSpoilage(spoilage, editingSpoilage.Quantity) : await API.addSpoilage(spoilage);
+    if (result.success) {
+      Toast.success('Recorded', result.message);
+      closeModal('spoilageModal');
+      await loadSpoilage();
+      await loadProductsForSpoilageDropdown();
+    } else Toast.error('Error', result.message);
+  } catch(e) { Toast.error('Error', 'Could not save. Check connection.'); }
   btn.disabled = false; btn.textContent = 'Save';
-  if (result.success) {
-    Toast.success('Recorded', result.message);
-    closeModal('spoilageModal');
-    await loadSpoilage();
-    await loadProductsForSpoilageDropdown();
-  } else Toast.error('Error', result.message);
 }
 
 async function deleteSpoilage(id, productID, quantity) {
@@ -1781,16 +1864,25 @@ async function loadReports() {
   const contentEl = document.getElementById('reportContent');
   if (loadingEl) loadingEl.style.display = 'block';
   if (contentEl) contentEl.style.display = 'none';
-  const result = await API.getReports('all', dateFrom, dateTo);
-  if (loadingEl) loadingEl.style.display = 'none';
-  if (contentEl) contentEl.style.display = 'block';
-  if (!result.success) { Toast.error('Error', result.message); return; }
-  reportGenerated = true;
-  const d = result.data;
-  renderReportSummary(d.summary);
-  renderSalesReport(d.sales);
-  renderStockInReport(d.stockIns);
-  renderSpoilageReport(d.spoilage);
+  try {
+    const result = await API.getReports('all', dateFrom, dateTo);
+    if (loadingEl) loadingEl.style.display = 'none';
+    if (contentEl) contentEl.style.display = 'block';
+    if (!result || !result.success) {
+      Toast.error('Reports', result && result.message ? result.message : 'Could not load reports.');
+      return;
+    }
+    reportGenerated = true;
+    const d = result.data;
+    renderReportSummary(d.summary);
+    renderSalesReport(d.sales);
+    renderStockInReport(d.stockIns);
+    renderSpoilageReport(d.spoilage);
+  } catch(e) {
+    if (loadingEl) loadingEl.style.display = 'none';
+    if (contentEl) contentEl.style.display = 'block';
+    Toast.error('Reports', 'Error loading reports. Check connection.');
+  }
 }
 
 function renderReportSummary(s) {
@@ -1903,12 +1995,19 @@ async function initAudit() {
 
 async function loadAuditLogs() {
   showTableLoading('auditTableBody', 7);
-  const result = await API.getAuditLogs();
-  if (!result.success) { Toast.error('Error', result.message); return; }
-  allAuditLogs = result.data || [];
-  auditPaginator = null;
-  filterAudit();
-  setText('#auditCount', allAuditLogs.length + ' records');
+  try {
+    const result = await API.getAuditLogs();
+    if (!result || !result.success) {
+      setHTML('#auditTableBody', '<tr><td colspan="7" style="text-align:center;padding:1.5rem">Could not load audit logs.</td></tr>');
+      return;
+    }
+    allAuditLogs = result.data || [];
+    auditPaginator = null;
+    filterAudit();
+    setText('#auditCount', allAuditLogs.length + ' records');
+  } catch(e) {
+    setHTML('#auditTableBody', '<tr><td colspan="7" style="text-align:center;padding:1.5rem">Error loading audit logs.</td></tr>');
+  }
 }
 
 function filterAudit() {
@@ -2001,12 +2100,19 @@ async function initUsers() {
 
 async function loadUsers() {
   showTableLoading('usersTableBody', 7);
-  const result = await API.getUsers();
-  if (!result.success) { Toast.error('Error', result.message); return; }
-  allUsers = result.data || [];
-  userPaginator = null;
-  filterUsers();
-  setText('#userCount', allUsers.length + ' users');
+  try {
+    const result = await API.getUsers();
+    if (!result || !result.success) {
+      setHTML('#usersTableBody', '<tr><td colspan="7" style="text-align:center;padding:1.5rem">Could not load users.</td></tr>');
+      return;
+    }
+    allUsers = result.data || [];
+    userPaginator = null;
+    filterUsers();
+    setText('#userCount', allUsers.length + ' users');
+  } catch(e) {
+    setHTML('#usersTableBody', '<tr><td colspan="7" style="text-align:center;padding:1.5rem">Error loading users.</td></tr>');
+  }
 }
 
 function filterUsers() {
@@ -2090,27 +2196,29 @@ async function saveUser() {
   if (!validateRequired(fields)) return;
   const btn = document.getElementById('saveUserBtn');
   btn.disabled = true; btn.textContent = 'Saving…';
-  let result;
-  if (editingUser) {
-    result = await API.updateUser({
-      userID:   document.getElementById('editUserID').value,
-      fullName: document.getElementById('userFullName').value.trim(),
-      role:     document.getElementById('userRole').value,
-      email:    document.getElementById('userEmail').value.trim(),
-      status:   document.getElementById('userStatus').value
-    });
-  } else {
-    result = await API.addUser({
-      username: document.getElementById('userUsername').value.trim(),
-      password: document.getElementById('userPassword').value,
-      fullName: document.getElementById('userFullName').value.trim(),
-      role:     document.getElementById('userRole').value,
-      email:    document.getElementById('userEmail').value.trim()
-    });
-  }
+  try {
+    let result;
+    if (editingUser) {
+      result = await API.updateUser({
+        userID:   document.getElementById('editUserID').value,
+        fullName: document.getElementById('userFullName').value.trim(),
+        role:     document.getElementById('userRole').value,
+        email:    document.getElementById('userEmail').value.trim(),
+        status:   document.getElementById('userStatus').value
+      });
+    } else {
+      result = await API.addUser({
+        username: document.getElementById('userUsername').value.trim(),
+        password: document.getElementById('userPassword').value,
+        fullName: document.getElementById('userFullName').value.trim(),
+        role:     document.getElementById('userRole').value,
+        email:    document.getElementById('userEmail').value.trim()
+      });
+    }
+    if (result.success) { Toast.success('Success', result.message); closeModal('userModal'); await loadUsers(); }
+    else Toast.error('Error', result.message);
+  } catch(e) { Toast.error('Error', 'Could not save user. Check connection.'); }
   btn.disabled = false; btn.textContent = 'Save User';
-  if (result.success) { Toast.success('Success', result.message); closeModal('userModal'); await loadUsers(); }
-  else Toast.error('Error', result.message);
 }
 
 function openResetPassword(id, username) {
@@ -2128,10 +2236,12 @@ async function resetPassword() {
   if (newPwd !== confirmPwd) { Toast.warning('Mismatch', 'Passwords do not match.'); return; }
   const btn = document.getElementById('resetPasswordBtn');
   btn.disabled = true; btn.textContent = 'Resetting…';
-  const result = await API.resetUserPassword(document.getElementById('resetUserID').value, newPwd);
+  try {
+    const result = await API.resetUserPassword(document.getElementById('resetUserID').value, newPwd);
+    if (result.success) { Toast.success('Done', result.message); closeModal('resetPasswordModal'); await loadUsers(); }
+    else Toast.error('Error', result.message);
+  } catch(e) { Toast.error('Error', 'Could not reset password. Check connection.'); }
   btn.disabled = false; btn.textContent = 'Reset Password';
-  if (result.success) { Toast.success('Done', result.message); closeModal('resetPasswordModal'); await loadUsers(); }
-  else Toast.error('Error', result.message);
 }
 
 async function deleteUser(id, username) {
@@ -2152,10 +2262,12 @@ async function changeOwnPassword() {
   const user = Auth.getUser();
   const btn = document.getElementById('changeOwnPwdBtn');
   btn.disabled = true; btn.textContent = 'Saving…';
-  const result = await API.changePassword(user.userID, current, newPwd);
+  try {
+    const result = await API.changePassword(user.userID, current, newPwd);
+    if (result.success) { Toast.success('Done', result.message); closeModal('changePasswordModal'); document.getElementById('changePasswordForm')?.reset(); }
+    else Toast.error('Error', result.message);
+  } catch(e) { Toast.error('Error', 'Could not change password. Check connection.'); }
   btn.disabled = false; btn.textContent = 'Change Password';
-  if (result.success) { Toast.success('Done', result.message); closeModal('changePasswordModal'); document.getElementById('changePasswordForm')?.reset(); }
-  else Toast.error('Error', result.message);
 }
 
 function setupUserModals() {
@@ -2375,30 +2487,29 @@ function _launchApp() {
   try {
     _pendingSession = null;
 
-    // Directly manipulate DOM — do NOT rely on Auth.isLoggedIn() here
-    // because Android localStorage may have a write delay after setSession.
+    // Hide login, show app shell
     var loginView = document.getElementById('loginView');
     var appShell  = document.getElementById('appShell');
     if (loginView) loginView.style.display = 'none';
     if (appShell)  appShell.style.display  = 'block';
 
-    // Setup sidebar, RBAC, logout button
+    // Setup sidebar user info, RBAC visibility, logout button, hamburger
     try { populateSidebarUser(); } catch(e) {}
     try { applyRBAC(); }          catch(e) {}
     try { initLogoutButton(); }   catch(e) {}
     try { initSidebarToggle(); }  catch(e) {}
 
-    // Hide all views, show dashboard directly
-    var views = ['dashboardView','posView','productsView','stockInView',
-                 'suppliersView','spoilageView','reportsView','auditLogsView','usersView'];
-    views.forEach(function(id) {
+    // Hide all content views, show dashboard
+    ['dashboardView','posView','productsView','stockInView',
+     'suppliersView','spoilageView','reportsView','auditLogsView','usersView']
+    .forEach(function(id) {
       var el = document.getElementById(id);
       if (el) el.style.display = 'none';
     });
     var dashView = document.getElementById('dashboardView');
     if (dashView) dashView.style.display = 'block';
 
-    // Update header title
+    // Update header
     var headerTitle = document.getElementById('headerTitle');
     if (headerTitle) headerTitle.textContent = 'Dashboard';
 
@@ -2408,24 +2519,16 @@ function _launchApp() {
     });
 
     // Load dashboard data
-    try { loadDashboard(); } catch(e) {}
+    try { loadDashboard(); } catch(e) { console.error('loadDashboard err:', e); }
 
-    // Wire up sidebar nav clicks
-    document.querySelectorAll('.nav-item[data-section]').forEach(function(item) {
-      if (!item._navBound) {
-        item._navBound = true;
-        item.addEventListener('click', function() {
-          navigateTo(item.dataset.section);
-        });
-      }
-    });
+    // NOTE: Nav-item clicks are already bound in DOMContentLoaded.
+    // Do NOT re-bind here — it causes double-firing of navigateTo().
 
   } catch(err) {
     console.error('_launchApp error:', err);
-    // Last resort — force show dashboard anyway
     try {
-      document.getElementById('loginView').style.display = 'none';
-      document.getElementById('appShell').style.display  = 'block';
+      document.getElementById('loginView').style.display  = 'none';
+      document.getElementById('appShell').style.display   = 'block';
       document.getElementById('dashboardView').style.display = 'block';
     } catch(e) {}
   }
